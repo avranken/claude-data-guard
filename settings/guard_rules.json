@@ -1,0 +1,36 @@
+{
+  "_comment": [
+    "Deny rules merged into ~/.claude/settings.json by install.ps1.",
+    "Deny takes precedence over allow and over every permission mode,",
+    "including auto and bypass. These rules do not depend on Python, so they",
+    "keep working even if the guard hook fails to start. They are the floor.",
+    "",
+    "Two kinds of rule are NOT here, because both are generated at install",
+    "time from the machine's own configuration: a pair per protected folder",
+    "name, and one per entry in BLOCKED_PROGRAMS in data_guard.py. The full",
+    "list that was actually installed is written to guard_config.json as",
+    "installed_deny_rules, which is what uninstall.ps1 removes.",
+    "",
+    "'retired' holds rules earlier versions installed. install.ps1 subtracts",
+    "them and uninstall.ps1 removes them, so a machine that already has them",
+    "is cleaned up rather than left carrying a rule nothing maintains."
+  ],
+  "deny": [
+    "Read(./.env)",
+    "Edit(./.claude/**)",
+    "Write(./.claude/**)",
+    "Bash(git push:*)",
+    "mcp__terminal__read_terminal",
+    "mcp__terminal__list_terminal_tabs"
+  ],
+  "retired": [
+    "mcp__Claude_Browser__navigate",
+    "mcp__Claude_Browser__javascript_tool",
+    "mcp__Claude_Browser__get_page_text",
+    "mcp__Claude_Browser__read_page",
+    "mcp__claude-in-chrome__navigate",
+    "mcp__claude-in-chrome__javascript_tool",
+    "mcp__claude-in-chrome__get_page_text",
+    "mcp__claude-in-chrome__read_page"
+  ]
+}

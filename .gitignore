@@ -1,0 +1,12 @@
+# This repository holds tooling only. It must never hold data.
+# The template's own .gitignore covers the projects created from it.
+
+__pycache__/
+*.pyc
+
+# Written by install.ps1 into the user's home, never into this repository.
+# Listed here so a stray copy cannot be committed with someone's real paths.
+guard_config.json
+
+# Settings backups, in case one is ever copied here while debugging.
+settings.json.backup-*
