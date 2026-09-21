@@ -97,8 +97,24 @@ Check 'Hook registered' ($null -ne $hookCommand) $hookCommand 'Run install.ps1'
 $pythonPath = $null
 if ($hookCommand -match '^"([^"]+)"') { $pythonPath = $Matches[1] }
 if ($pythonPath) {
-    Check 'Pinned Python still exists' (Test-Path $pythonPath) $pythonPath `
+    Check 'Hook interpreter exists' (Test-Path $pythonPath) $pythonPath `
         'Python moved or was upgraded. Re-run install.ps1 to repoint the hook.'
+
+    # Existing is not the same as working. py.exe can be present and still fail
+    # to find a Python, and a pinned python.exe can be present and broken. The
+    # only honest check is to run the guard the way Claude Code runs it and
+    # require the answer we depend on.
+    if ((Test-Path $pythonPath) -and (Test-Path $guardPath) -and $folderNames.Count -gt 0) {
+        $payload = '{"tool_name":"Read","tool_input":{"file_path":"./' +
+                   $folderNames[0] + '/__probe__.csv"}}'
+        $answer = ''
+        try { $answer = "$($payload | & $pythonPath $guardPath 2>&1)" } catch { $answer = "$_" }
+        $refused = $answer -match '"permissionDecision":\s*"deny"'
+        Check 'Hook interpreter actually runs the guard' $refused `
+            $(if ($refused) { 'a protected path was refused' }
+              else { "no refusal came back: $($answer.Trim())" }) `
+            'The interpreter cannot start the guard. Re-run install.ps1.'
+    }
 }
 
 # Every rule install.ps1 recorded must still be in settings.json. A count

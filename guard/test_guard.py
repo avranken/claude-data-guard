@@ -18,11 +18,14 @@ completely broken guard denies everything and passes every DENY case. Only an
 ALLOW case can tell you the guard is working rather than merely bricked.
 """
 
+import atexit
 import importlib.util
 import json
 import os
+import shutil
 import subprocess
 import sys
+import tempfile
 
 DEFAULT_GUARD = os.path.join(os.path.expanduser("~"), ".claude", "hooks",
                              "data_guard.py")
@@ -33,6 +36,34 @@ DATA_EXT = ".xlsx"
 
 # A folder name nobody would configure, used for the cases that must be allowed.
 NEUTRAL_DIR = "notes"
+
+
+_PROJECTS = {}
+
+
+def sample_project(data_folder):
+    """A throwaway project on disk, because the recursion rule reads the disk.
+
+    Two of them: one with a protected folder in it and one without, so the
+    cases can show the rule firing and NOT firing. Built once and reused.
+    """
+    if data_folder in _PROJECTS:
+        return _PROJECTS[data_folder]
+
+    root = tempfile.mkdtemp(prefix="guardcase-")
+    atexit.register(shutil.rmtree, root, True)
+
+    withdata = os.path.join(root, "study")
+    os.makedirs(os.path.join(withdata, data_folder))
+    os.makedirs(os.path.join(withdata, "src"))
+    with open(os.path.join(withdata, "src", "analyse.py"), "w") as handle:
+        handle.write("print('hi')\n")
+
+    plain = os.path.join(root, "tooling")
+    os.makedirs(os.path.join(plain, "src"))
+
+    _PROJECTS[data_folder] = (withdata, plain)
+    return _PROJECTS[data_folder]
 
 
 def load_guard(path):
@@ -85,6 +116,13 @@ def build_essential_cases(guard):
         cases.append((False, "Allows the one permitted run command", "Bash",
                       {"command": "%s %s sim.py"
                                   % (runner_python, runner_script)}))
+
+    # The recursion rule reads the disk, so it is the one piece of logic that
+    # can be broken by something about this machine rather than by the code.
+    # One case here, the rest in the full suite.
+    withdata, _plain = sample_project(folders[0])
+    cases.append((True, "Refuses a search of a project holding one", "Bash",
+                  {"command": "grep -r subject_id ."}, withdata))
 
     return cases
 
@@ -146,6 +184,22 @@ def build_cases(guard, guard_path):
          {"command": "./build.sh"}),
         (True, "A batch file by Windows relative path", "Bash",
          {"command": ".\\run.bat"}),
+
+        # Handing the script to an interpreter instead of executing it. Only
+        # the first token of a segment is examined, so until these programs
+        # were blocked by name, every one of these ran.
+        (True, "A script handed to powershell", "Bash",
+         {"command": "powershell -File run.ps1"}),
+        (True, "Arbitrary code through powershell", "Bash",
+         {"command": "powershell -NoProfile -Command \"Get-Content secret\""}),
+        (True, "A script handed to cmd", "Bash",
+         {"command": "cmd /c run.bat"}),
+        (True, "A script handed to bash", "Bash",
+         {"command": "bash build.sh"}),
+        (True, "A script handed to a script host", "Bash",
+         {"command": "cscript hidden.vbs"}),
+        (True, "Another runtime entirely", "Bash",
+         {"command": "node analyse.js"}),
 
         # The guard protects itself, at its installed location.
         (True, "Overwrite the installed settings file", "Write",
@@ -219,15 +273,75 @@ def build_cases(guard, guard_path):
         cases.append((False, "Runner spelled %s..." % spelling[:12], "Bash",
                       {"command": "%s %s sim.py" % (runner_python, spelling)}))
 
+    # Recursion, against real folders on disk. 'withdata' holds a protected
+    # folder, 'plain' does not. The ALLOW half matters as much as the DENY
+    # half: a rule that refuses every recursive command would be unusable and
+    # would get switched off.
+    withdata, plain = sample_project(first)
+    cases += [
+        (True, "grep -r over the project", "Bash",
+         {"command": "grep -r subject_id ."}, withdata),
+        (True, "grep -rn, bundled flags", "Bash",
+         {"command": "grep -rn id ."}, withdata),
+        (True, "a glob crossing a folder boundary", "Bash",
+         {"command": "cat */*.csv"}, withdata),
+        (True, "find over the project", "Bash",
+         {"command": "find . -name '*.csv'"}, withdata),
+        (True, "tar of the project", "Bash",
+         {"command": "tar cf backup.tar ."}, withdata),
+        (True, "copying the project elsewhere", "Bash",
+         {"command": "cp -r . ../copy"}, withdata),
+        (True, "the Grep tool with no path", "Grep",
+         {"pattern": "patient"}, withdata),
+        (True, "the Grep tool pointed at the root", "Grep",
+         {"pattern": "patient", "path": "."}, withdata),
+        (True, "the Glob tool over everything", "Glob",
+         {"pattern": "**/*.csv"}, withdata),
+
+        # Scoped to a folder that holds no data. This is the escape hatch, and
+        # without it the rule would simply be turned off by whoever hits it.
+        (False, "grep -r scoped to a code folder", "Bash",
+         {"command": "grep -r subject_id src/"}, withdata),
+        (False, "the Grep tool scoped to a code folder", "Grep",
+         {"pattern": "id", "path": "src"}, withdata),
+        # Glob carries its scope in the pattern, not in a path field.
+        (False, "a Glob scoped by its own pattern", "Glob",
+         {"pattern": "src/**/*.py"}, withdata),
+        (True, "a Glob whose pattern names the data folder", "Glob",
+         {"pattern": "%s/*" % first}, withdata),
+        # Cannot leave the folder it starts in, so it is no worse than 'ls'.
+        (False, "a Glob of one folder only", "Glob",
+         {"pattern": "*.R"}, withdata),
+
+        # Windows spelling of a recursive listing.
+        (True, "dir /s over the project", "Bash",
+         {"command": "dir /s /b"}, withdata),
+
+        # A project with no protected folder anywhere: recursion is ordinary.
+        (False, "grep -r in a project with no data folder", "Bash",
+         {"command": "grep -r todo ."}, plain),
+        (False, "the Grep tool in a project with no data folder", "Grep",
+         {"pattern": "todo", "path": "."}, plain),
+
+        # Not recursive at all, so the rule must not fire.
+        (False, "reading one named file", "Bash",
+         {"command": "cat src/analyse.py"}, withdata),
+        (False, "listing one folder", "Bash",
+         {"command": "ls -la src"}, withdata),
+    ]
+
     return cases
 
 
-def run_guard(guard_path, tool_name, tool_input):
-    payload = json.dumps({
+def run_guard(guard_path, tool_name, tool_input, cwd=None):
+    body = {
         "hook_event_name": "PreToolUse",
         "tool_name": tool_name,
         "tool_input": tool_input,
-    })
+    }
+    if cwd:
+        body["cwd"] = cwd
+    payload = json.dumps(body)
     result = subprocess.run([sys.executable, guard_path], input=payload,
                             capture_output=True, text=True)
     denied = '"permissionDecision": "deny"' in result.stdout
@@ -263,8 +377,10 @@ def main(argv):
 
     failures = 0
     allow_failures = 0
-    for should_deny, label, tool_name, tool_input in cases:
-        denied, output = run_guard(guard_path, tool_name, tool_input)
+    for case in cases:
+        should_deny, label, tool_name, tool_input = case[:4]
+        cwd = case[4] if len(case) > 4 else None
+        denied, output = run_guard(guard_path, tool_name, tool_input, cwd)
         ok = denied == should_deny
         print("[%s] want %-5s got %-5s  %s" % (
             "pass" if ok else "FAIL",

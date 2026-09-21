@@ -91,6 +91,40 @@ if (-not (Test-Path $pythonPath)) { Fail "Python resolved to '$pythonPath', whic
 
 $pythonVersion = (& $pythonPath --version 2>&1) -join ' '
 
+# Prefer the Windows Python launcher to a specific interpreter. A pinned
+# python.exe dies the day Python is upgraded or that version is removed, and
+# the hook then fails to start. Claude Code logs that and carries on, so the
+# protection disappears without announcing itself. py.exe lives in the Windows
+# folder, is not tied to a version, and finds whatever Python is installed.
+#
+# Chosen by test rather than by assumption. On at least one machine here,
+# py.exe reports "No installed Python found!" for 'py -0' and yet runs a script
+# with a shebang perfectly well, because it resolves '#!/usr/bin/env python'
+# through PATH. So the probe is a real script file, which is how the hook is
+# actually invoked, and the launcher is used only if the probe works.
+function Resolve-HookInterpreter {
+    param([string]$Fallback)
+
+    $launcher = Join-Path $env:SystemRoot 'py.exe'
+    if (-not (Test-Path $launcher)) { return $Fallback }
+
+    $probe = Join-Path ([System.IO.Path]::GetTempPath()) `
+        ("guard-launcher-probe-" + [guid]::NewGuid().ToString('N') + ".py")
+    try {
+        # The same shebang the guard carries, so this tests the real mechanism.
+        Set-Content -Path $probe -Value "#!/usr/bin/env python`nprint('ok')" -Encoding ASCII
+        $output = & $launcher $probe 2>&1
+        if ($LASTEXITCODE -eq 0 -and "$output".Trim() -eq 'ok') { return $launcher }
+    } catch {
+        # Any failure at all means fall back. This must never abort the install.
+    } finally {
+        if (Test-Path $probe) { Remove-Item $probe -Force -ErrorAction SilentlyContinue }
+    }
+    return $Fallback
+}
+
+$hookPython = Resolve-HookInterpreter -Fallback $pythonPath
+
 # ---------------------------------------------------------------------------
 # The one question. Researchers keep data in a subfolder of the project, so a
 # folder NAME is the whole rule. One answer covers every project, including
@@ -131,6 +165,12 @@ foreach ($name in @($defaults + $extraFolders)) {
 
 Write-Host ''
 Write-Row 'Python' "$pythonVersion at $pythonPath"
+if ($hookPython -ne $pythonPath) {
+    Write-Row 'Launcher' "$hookPython, so the hook survives a Python upgrade"
+} else {
+    Write-Warn "No usable py.exe, so the hook is pinned to the path above."
+    Write-Warn "If Python moves or is upgraded, run doctor.ps1."
+}
 
 New-Item -ItemType Directory -Force -Path $hooksDir | Out-Null
 
@@ -210,6 +250,9 @@ $blocked = @()
 try {
     # Filtered, because @($null).Count is 1 in PowerShell: an empty or absent
     # result would otherwise look populated and generate 'Bash(:*)'.
+    # Deliberately the direct interpreter, not the launcher. This is a '-c'
+    # invocation with no script file and therefore no shebang, which is exactly
+    # the case where py.exe can fail to find a Python at all.
     $blocked = @((& $pythonPath -c $reader | ConvertFrom-Json) | Where-Object { $_ })
 } catch {
     Fail @"
@@ -241,7 +284,7 @@ Write-JsonFile $configTarget ([PSCustomObject]@{
     protected_folders = $folderNames
     # The only interpreter and the only script Claude may execute, both pinned
     # to absolute paths. The guard compares against these exactly.
-    runner_python     = $pythonPath
+    runner_python     = $hookPython
     runner_script     = $runnerTarget
     # Exactly what was merged into settings.json, so uninstall.ps1 removes
     # exactly that and nothing else.
@@ -269,7 +312,9 @@ foreach ($suite in @(
     @{ Name = 'guard';  Script = 'guard\test_guard.py';  Target = $guardTarget },
     @{ Name = 'runner'; Script = 'guard\test_runner.py'; Target = $runnerTarget }
 )) {
-    $output = & $pythonPath (Join-Path $repo $suite.Script) '--essential' $suite.Target 2>&1
+    # Run the suites under the interpreter the hook will actually use, so a
+    # launcher that cannot start the guard fails here rather than in a session.
+    $output = & $hookPython (Join-Path $repo $suite.Script) '--essential' $suite.Target 2>&1
     if ($LASTEXITCODE -ne 0) {
         $output | ForEach-Object { Write-Host $_ }
         Fail @"
@@ -349,7 +394,7 @@ Set-Prop $settings.permissions 'deny' $mergedDeny
 
 # Hooks: drop any previous guard entry, then add the current one. This makes
 # re-running the installer idempotent and repoints a stale Python path.
-$hookCommand = '"{0}" "{1}"' -f $pythonPath, ($guardTarget -replace '\\', '/')
+$hookCommand = '"{0}" "{1}"' -f $hookPython, ($guardTarget -replace '\\', '/')
 $newEntry = [PSCustomObject]@{
     matcher = '*'
     hooks   = @([PSCustomObject]@{ type = 'command'; command = $hookCommand; timeout = 15 })

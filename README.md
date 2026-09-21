@@ -2,9 +2,14 @@
 
 This tool stops Claude from reading your research data.
 
-Claude can still help you write code. It cannot open your data files. You run
-your analysis yourself, on your own computer, and you decide which results to
-show Claude.
+It refuses anything that names your data folder, and it refuses searches of a
+whole project, which would otherwise read the folder without ever naming it.
+
+Claude can still help you write code. You run your analysis yourself, on your
+own computer, and you decide which results to show Claude.
+
+It reduces the chance of a mistake. It is not a wall. Please read **What this
+tool does not do** before you rely on it.
 
 It works in every project on your computer. It also works when you let Claude
 work on its own without asking you for permission.
@@ -51,11 +56,18 @@ You can run the installer again later to add more names. This is safe.
 
 ### If PowerShell refuses to run the file
 
-Your computer may block scripts. Try this instead:
+There are two possible reasons.
+
+Your own settings may block scripts. Try this:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\install.ps1
 ```
+
+Or your computer may only allow scripts in certain folders. If the message
+mentions a policy, move the unpacked folder to a location your IT department
+allows. At KU Leuven that is `C:\GBW_MyDownloads`, and the command above will
+not help, because this restriction is a different one.
 
 ## Check that it works
 
@@ -91,6 +103,12 @@ my-study\
 That is all. There is nothing to set up for each new project. Make your project
 folders in Windows Explorer, as you would do normally.
 
+One thing you will notice. If you ask Claude to search the whole project, it is
+refused and told to search one folder instead. That is deliberate. A search of
+everything reads your data folder without ever naming it, so it is the easiest
+way for data to reach Claude by accident. Asking about `src\` or about one file
+works normally.
+
 ## Telling Claude about your data
 
 Claude cannot see your data, so it does not know your variable names. Without
@@ -116,18 +134,28 @@ will find the right way by itself.
 
 ## What this tool does not do
 
-Please read this section. It is short.
+Please read this section. It is short, and the first point is the important
+one.
+
+**Whole project searches are refused, but the check is not perfect.** The
+guard recognises the usual shapes: recursive flags like `-r`, wildcards that
+cross a folder boundary like `*/*.csv`, and tools that walk a tree such as
+`find` and `tar`. A command that reaches your data in some other way might not
+be recognised. If Claude ever wants to run something you do not understand in
+a project that holds data, say no and ask what it would read.
 
 **It only protects folders with the right name.** If your data is in a folder
 called `Metingen` and you did not type that name during install, Claude can
 read it. Run `.\install.ps1` again and add the name.
 
 **It does not protect a file outside a data folder.** `my-study\data\cohort.xlsx`
-is protected. `my-study\cohort.xlsx` is not. Always put data in the folder.
+is protected by name. `my-study\cohort.xlsx` is not. Always put data in the
+folder.
 
-**Claude can see file names.** It cannot open the files, but it can see a list
-of what is in the folder. If your file names contain patient names or patient
-numbers, this matters. If they look like `cohort_2024.xlsx`, it does not.
+**Claude can see that the folder exists.** A plain `ls` of your project shows
+`data\` as a name, the same way Windows Explorer does. The file names inside it
+are refused, along with the contents. If your **folder** names contain patient
+information, that matters.
 
 **It does not check what you paste into the chat.** A table, a figure, or an
 error message can still contain personal data. Look at anything before you give
@@ -141,7 +169,9 @@ Run this. It checks everything and changes nothing.
 .\doctor.ps1
 ```
 
-Run it after Python is updated on your computer, or whenever you are unsure.
+Run it whenever you are unsure, or if Claude ever reads something it should
+not have. It checks that the guard is installed, that it can still start, and
+that none of its rules have gone missing.
 
 ## Remove it
 
@@ -154,7 +184,7 @@ not touched or moved.
 
 ---
 
-The guard itself is two Python files in the `guard\` folder, about 650 lines in
+The guard itself is two Python files in the `guard\` folder, about 850 lines in
 total. You are welcome to read them, or to ask a technical colleague to read
 them for you.
 

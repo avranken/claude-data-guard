@@ -1,9 +1,16 @@
 #!/usr/bin/env python
 """PreToolUse guard for Claude Code.
 
-Blocks any tool call that could reach protected research data. Runs before
-every tool call, in every permission mode, including auto and bypass. Fails
-closed: anything unexpected results in a denial, never in an allowed call.
+Refuses any tool call that NAMES a protected folder. Runs before every tool
+call, in every permission mode, including auto and bypass. Fails closed:
+anything unexpected results in a denial, never in an allowed call.
+
+Read that first sentence literally. This inspects strings, so it refuses what
+points at the data and cannot refuse what merely reaches it. A recursive read
+from the project root, such as 'grep -r x .' or 'cat */*.csv', names no
+protected folder and is therefore allowed, and it will read the data. That is
+the most likely way this tool fails, it is documented in the README, and it is
+a property of inspecting commands rather than filesystems.
 
 This file is owned by the researcher, not by Claude. Claude Code is denied
 write access to it. If you need to change it, edit it yourself and then run
@@ -52,12 +59,30 @@ DEFAULT_DATA_FOLDERS = ["data", "raw", "staging", "patients", "subjects"]
 # Programs Claude must never run. Analysis code can read protected data from a
 # path hardcoded inside a script, which no command line inspection can see, so
 # the interpreters themselves are off limits. The researcher runs analyses.
+#
+# The second group is shells and general purpose interpreters. They are here
+# because only the FIRST token of each command segment is examined, which left
+# the rule below on script extensions trivial to step around:
+#
+#     ./run.ps1                  -> token 'run.ps1'     refused
+#     powershell -File run.ps1   -> token 'powershell'  allowed, and ran
+#
+# Enumerating names is the weaker kind of defence and it is honest to say so.
+# It closes the spellings a person or a model reaches for by habit, which is
+# the failure this guard exists to prevent. It does not close every one: a
+# Windows machine has many programs that will execute code on request, and
+# mshta, rundll32 and regsvr32 are deliberately not listed here, because that
+# is an adversary working to get around the guard rather than an accident, and
+# a list that pretends to cover it would be overselling itself.
 BLOCKED_PROGRAMS = [
     "python", "python3", "py", "pythonw", "ipython", "jupyter", "jupyter-lab",
     "jupyter-notebook", "conda", "mamba", "pip", "pip3", "uv", "poetry",
     "r", "rscript", "radian", "rstudio",
     "julia", "matlab", "octave", "stata", "sas", "spss",
     "duckdb", "sqlite3", "psql", "mysql", "mongo", "mongosh",
+    # Shells, script hosts and general purpose interpreters.
+    "powershell", "pwsh", "cmd", "bash", "sh", "node", "perl",
+    "cscript", "wscript", "wsl",
 ]
 
 # Fields carrying Claude's own prose or code output rather than a path it
@@ -103,6 +128,41 @@ SCRIPT_EXTENSIONS = (".cmd", ".bat", ".ps1", ".sh", ".exe", ".com", ".vbs",
                      ".js", ".jse", ".wsf", ".msi")
 
 RELATIVE_PREFIXES = ("./", ".\\", "../", "..\\")
+
+# --------------------------------------------------------------------------
+# Recursion.
+#
+# Everything above refuses a request that NAMES a protected folder. A
+# recursive read names nothing and reaches everything: 'grep -r x .' from a
+# project root walks into the data folder and returns the matching lines. That
+# is not an exotic evasion, it is the first command anyone types, which makes
+# it the most likely way this guard fails.
+#
+# So: when a command would search or copy a whole tree, and a protected folder
+# exists somewhere under the root it would start from, refuse it and say which
+# folder and what to do instead. Scoping the search to a subfolder that holds
+# no data still works, which is what keeps this liveable.
+#
+# The walk below is bounded. A guard that hangs on a large tree would be its
+# own kind of failure.
+RECURSIVE_FLAGS = ("-r", "-R", "--recursive", "--recurse",
+                   "--dereference-recursive",
+                   # Windows spelling, as in 'dir /s' or 'xcopy /s'.
+                   "/s", "/s/b", "/b/s")
+
+# Programs that walk a tree whether or not a flag says so.
+RECURSIVE_PROGRAMS = (
+    "find", "tree", "du", "tar", "zip", "unzip", "7z", "rsync", "robocopy",
+    "xcopy", "rg", "ag", "ack", "fd", "ripgrep",
+)
+
+# Tools whose whole purpose is to search a tree.
+RECURSIVE_TOOLS = ("Grep", "Glob")
+
+MAX_SCAN_DIRS = 2000
+MAX_SCAN_DEPTH = 8
+SKIP_DIRS = {".git", "node_modules", "__pycache__", ".venv", "venv",
+             ".Rproj.user", ".idea", ".vscode", "renv"}
 
 # --------------------------------------------------------------------------
 # IMPLEMENTATION
@@ -216,6 +276,135 @@ def check_path_like(text, fragments, match_bare=False):
                         % fragment.strip("/"))
 
     return None
+
+
+def protected_folder_under(root, names):
+    """The first protected folder at or under root, or None.
+
+    Bounded on purpose. If the tree is bigger than the caps allow, this
+    returns a marker rather than None, because 'I could not finish looking'
+    must not be reported as 'there is nothing there'.
+    """
+    try:
+        root = os.path.realpath(root)
+        if not os.path.isdir(root):
+            return None
+    except OSError:
+        return "?"
+
+    wanted = set(names)
+    if os.path.basename(root).lower() in wanted:
+        return os.path.basename(root)
+
+    seen = 0
+    queue = [(root, 0)]
+    while queue:
+        current, depth = queue.pop()
+        if depth >= MAX_SCAN_DEPTH:
+            continue
+        try:
+            entries = list(os.scandir(current))
+        except OSError:
+            continue  # Unreadable is not evidence of absence, but it is also
+            #           not somewhere a tool of ours is going to read from.
+        for entry in entries:
+            try:
+                if not entry.is_dir(follow_symlinks=False):
+                    continue
+            except OSError:
+                continue
+            name = entry.name
+            if name.lower() in wanted:
+                return name
+            if name in SKIP_DIRS or name.startswith("."):
+                continue
+            seen += 1
+            if seen > MAX_SCAN_DIRS:
+                return "?"  # Too big to be sure. Fail closed.
+            queue.append((entry.path, depth + 1))
+    return None
+
+
+def looks_recursive(command):
+    """True if this command would walk a tree rather than touch a named file."""
+    tokens = split_command_tokens(re.sub(r"\\[ \t]*\r?\n", " ", command))
+    for index, token in enumerate(tokens):
+        low = norm(token)
+        if low in RECURSIVE_FLAGS:
+            return True
+        # Bundled short flags, as in 'grep -rn' or 'ls -laR'.
+        if re.match(r"^-[a-z]+$", token) and "r" in token:
+            return True
+        if re.match(r"^-[A-Z]+$", token) and "R" in token:
+            return True
+        if index == 0 or (index > 0 and tokens[index - 1] in ("|", "&&")):
+            if program_name(token) in RECURSIVE_PROGRAMS:
+                return True
+        # A glob that can cross a directory boundary.
+        if "**" in low or re.search(r"\*[^/\\]*[/\\]", low):
+            return True
+    # Any segment's program, not just the first token.
+    for token in bash_program_tokens(command):
+        if program_name(token) in RECURSIVE_PROGRAMS:
+            return True
+    return False
+
+
+def search_roots(command, cwd):
+    """Directories this command could start walking from.
+
+    Path shaped arguments that actually exist, so that 'grep -r id src/' is
+    judged on src/ rather than on the whole project. A command naming no
+    existing directory is judged on the working directory, which is what
+    'grep -r id .' and a bare 'find' amount to.
+    """
+    roots = []
+    for token in split_command_tokens(command):
+        if token.startswith("-"):
+            continue
+        candidate = token.strip("\"'")
+        # Strip a trailing glob segment: 'src/*.csv' is a search of 'src'.
+        if "*" in candidate or "?" in candidate:
+            candidate = os.path.dirname(candidate.replace("\\", "/"))
+        if not candidate:
+            continue
+        try:
+            resolved = os.path.realpath(os.path.join(cwd, candidate))
+        except (OSError, ValueError):
+            continue
+        if os.path.isdir(resolved) and resolved not in roots:
+            roots.append(resolved)
+    return roots or [cwd]
+
+
+def tool_search_root(tool_name, tool_input, cwd):
+    """Where a Grep or Glob call would start walking.
+
+    Glob carries its scope in the pattern rather than in a path field, so
+    'src/**/*.R' is a search of src/ and must keep working. Reading only the
+    path field would refuse every glob in a project that holds data, which is
+    the kind of friction that gets a guard switched off.
+    """
+    base = tool_input.get("path") or cwd
+    try:
+        root = os.path.realpath(os.path.join(cwd, str(base)))
+    except (OSError, ValueError):
+        root = cwd
+    if not os.path.isdir(root):
+        root = os.path.dirname(root) or cwd
+
+    if tool_name == "Glob":
+        pattern = str(tool_input.get("pattern") or "").replace("\\", "/")
+        literal = re.split(r"[*?\[]", pattern)[0]
+        literal = literal.rsplit("/", 1)[0] if "/" in literal else ""
+        if literal:
+            try:
+                scoped = os.path.realpath(os.path.join(root, literal))
+                if os.path.isdir(scoped):
+                    root = scoped
+            except (OSError, ValueError):
+                pass
+    return root
 
 
 def bash_program_tokens(command):
@@ -354,6 +543,39 @@ def is_runner_invocation(command):
             and norm_exec_path(tokens[1]) == norm_exec_path(runner_path))
 
 
+def shallow_glob(tool_name, tool_input):
+    """True for a Glob that cannot leave the folder it starts in.
+
+    '*.R' lists one folder and can no more reach a subfolder than 'ls' can.
+    Refusing it would cost a great deal of ordinary work for no protection,
+    and the folder it starts in has already been checked by name.
+    """
+    if tool_name != "Glob":
+        return False
+    pattern = str(tool_input.get("pattern") or "").replace("\\", "/")
+    return bool(pattern) and "**" not in pattern and "/" not in pattern
+
+
+def recursion_reason(found, root, cwd):
+    """Why a whole tree search was refused, and what to do instead."""
+    try:
+        shown = os.path.relpath(root, cwd)
+    except ValueError:
+        shown = root
+    if shown == ".":
+        shown = "this project"
+    if found == "?":
+        return ("this searches a whole tree, and %s is too large to check for "
+                "a protected folder in the time available, so it is refused. "
+                "Search a specific subfolder instead." % shown)
+    return ("this searches everything under %s, which contains the protected "
+            "folder '%s', so it would read the research data without ever "
+            "naming it.\n\n"
+            "Name the subfolder you actually want, for example the one "
+            "holding the code. If you genuinely need to know what is in the "
+            "data folder, ask the researcher." % (shown, found))
+
+
 def main():
     raw = sys.stdin.read()
     if not raw.strip():
@@ -363,8 +585,13 @@ def main():
     tool_name = payload.get("tool_name", "")
     tool_input = payload.get("tool_input", {})
 
-    fragments = fragments_for(load_data_folders())
+    folders = load_data_folders()
+    fragments = fragments_for(folders)
     strings = list(walk_strings(tool_input))
+
+    # Claude Code sends the working directory. Older versions may not, and the
+    # hook's own cwd is the session's, so it is a reasonable stand in.
+    cwd = payload.get("cwd") or os.getcwd()
 
     # 1. The guard cannot be edited by the thing it restricts.
     if tool_name in MUTATING_TOOLS:
@@ -407,6 +634,23 @@ def main():
                     deny("executing '%s' is not permitted. Running a file from "
                          "the project by relative path is how an interpreter "
                          "block gets bypassed.\n\n%s" % (token, runner_hint()))
+
+    # 4. Recursion. Nothing above can catch a command that walks into the data
+    #    folder without naming it, which is the likeliest way this guard fails.
+    if tool_name == "Bash":
+        command = tool_input.get("command", "")
+        if isinstance(command, str) and looks_recursive(command):
+            for root in search_roots(command, cwd):
+                found = protected_folder_under(root, folders)
+                if found is not None:
+                    deny(recursion_reason(found, root, cwd))
+
+    if tool_name in RECURSIVE_TOOLS and not shallow_glob(tool_name, tool_input):
+        # These search a tree by definition, so the only question is which one.
+        root = tool_search_root(tool_name, tool_input, cwd)
+        found = protected_folder_under(root, folders)
+        if found is not None:
+            deny(recursion_reason(found, root, cwd))
 
     allow()
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Run code with the research data out of reach.
+"""Run project code that has been checked for references to the data.
 
 The single permitted entry point for executing anything from a Claude Code
 session. It lives in the guarded directory, so Claude cannot edit it, which
@@ -168,7 +168,7 @@ def truncate(text, label):
 def main():
     parser = argparse.ArgumentParser(
         prog="run_checked.py",
-        description="Run project code with the research data out of reach.")
+        description="Run a project file, after checking it names no data folder.")
     parser.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT,
                         help="seconds before the run is killed (default %d). "
                              "Must come before the script." % DEFAULT_TIMEOUT)
